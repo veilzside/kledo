@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <title>Pengecekan Selisih Stok (Anti Bug Kolom)</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 30px; background-color: #f4f6f9; color: #333; }
+        .container { max-width: 650px; margin: auto; padding: 25px; background: white; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
+        h2 { margin-top: 0; color: #2c3e50; border-bottom: 2px solid #edf2f7; padding-bottom: 10px; }
+        label { display: block; margin-top: 20px; font-weight: bold; color: #4a5568; }
+        input, select { width: 100%; margin-top: 8px; padding: 10px; border: 1px solid #cbd5e0; border-radius: 6px; box-sizing: border-box; }
+        .btn-proses { width: 100%; margin-top: 25px; padding: 12px; background: #3182ce; color: white; border: none; border-radius: 6px; font-size: 16px; font-weight: bold; cursor: pointer; transition: background 0.2s; }
+        .btn-proses:hover { background: #2b6cb0; }
+        .status { margin-top: 20px; padding: 12px; border-radius: 6px; display: none; font-weight: 500; }
+        .success { background-color: #c6f6d5; color: #22543d; }
+        .error { background-color: #fed7d7; color: #742a2a; }
+        .info { background-color: #e2e8f0; color: #2d3748; }
+        
+        /* Area Download */
+        .download-box { margin-top: 20px; padding: 15px; border: 2px dashed #cbd5e0; border-radius: 8px; background-color: #f7fafc; display: none; }
+        .btn-download { width: 100%; margin-top: 10px; padding: 10px; color: white; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 14px; }
+        .btn-diff { background-color: #e53e3e; }
+        .btn-diff:hover { background-color: #c53030; }
+        .btn-full { background-color: #38a169; }
+        .btn-full:hover { background-color: #2f855a; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>Pencocokan Stok Kledo vs Real</h2>
+    
+    <label>1. Upload Laporan Kledo:</label>
+    <input type="file" id="fileKledo">
+
+    <label>2. Upload Hasil Stok Opname (NS):</label>
+    <input type="file" id="fileOpname" onchange="handleOpnameUpload(this)">
+
+    <div id="dateSelectionArea" style="display:none;">
+        <label>3. Pilih Tanggal Stok Opname:</label>
+        <select id="pilihTanggal"></select>
+    </div>
+
+    <button class="btn-proses" onclick="prosesStok()">Proses & Hitung Selisih</button>
+    
+    <div id="status" class="status"></div>
+
+    <div id="downloadArea" class="download-box">
+        <b style="color: #4a5568;">Silakan Pilih File yang Ingin Di-download:</b>
+        <button class="btn-download btn-diff" onclick="downloadHanyaSelisih()">1. Download Hanya Yang Selisih (CSV)</button>
+        <button class="btn-download btn-full" onclick="downloadSemuaStok()">2. Download Semua Stok + Kledo + Selisih (CSV)</button>
+    </div>
+</div>
+
+<script>
+    let dataOpnameMentah = null;
+    let headersOpname = [];
+    let csvHanyaSelisih = "";
+    let csvSemuaStok = "";
+    let tanggalTeks = "Stok";
+
+    function bacaExcel(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const data = new Uint8Array(e.target.result);
+                    const workbook = XLSX.read(data, { type: 'array' });
+                    const firstSheetName = workbook.SheetNames[0];
+                    const worksheet = workbook.Sheets[firstSheetName];
+                    const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1, raw: false, defval: "" });
+                    resolve(rows);
+                } catch (err) {
+                    reject(err);
+                }
+            };
+            reader.onerror = (err) => reject(err);
+            reader.readAsArrayBuffer(file);
+        });
+    }
+
+    function cariBarisHeader(rows, kataKunci) {
+        for (let i = 0; i < rows.length; i++) {
+            if (rows[i].some(cell => String(cell).trim().toLowerCase() === kataKunci.toLowerCase())) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    function aoaKeCsv(aoa) {
+        return "\uFEFF" + aoa.map(row => {
+            return row.map(cell => {
+                let c = String(cell === null || cell === undefined ? "" : cell);
+                if (c.includes(",") || c.includes('"') || c.includes("\n") || c.includes("\r")) {
+                    c = '"' + c.replace(/"/g, '""') + '"';
+                }
+                return c;
+            }).join(",");
+        }).join("\n");
+    }
+
+    async function handleOpnameUpload(input) {
+        const file = input.files[0];
+        if (!file) return;
+
+        tampilkanStatus("Membaca data file opname...", "info");
+        document.getElementById('downloadArea').style.display = 'none';
+
+        try {
+            dataOpnameMentah = await bacaExcel(file);
+            const idxHeader = cariBarisHeader(dataOpnameMentah, "Nama Produk");
+            
+            if (idxHeader === -1) {
+                tampilkanStatus("Gagal menemukan kolom 'Nama Produk' di file opname!", "error");
+                return;
+            }
+
+            headersOpname = dataOpnameMentah[idxHeader].map(h => String(h).trim());
+
+            const selectTanggal = document.getElementById('pilihTanggal');
+            selectTanggal.innerHTML = "";
+            
+            let adaTanggal = false;
+            headersOpname.forEach((h, index) => {
+                if (h && h !== "Nama Produk" && h !== "Kledo" && h !== "Stok Lama" && !h.startsWith("Unnamed")) {
+                    let opt = document.createElement('option');
+                    opt.value = index;
+                    opt.innerText = h;
+                    selectTanggal.appendChild(opt);
+                    adaTanggal = true;
+                }
+            });
+
+            if (adaTanggal) {
+                document.getElementById('dateSelectionArea').style.display = 'block';
+                tampilkanStatus("File opname berhasil dibaca. Silakan pilih tanggal opname.", "info");
+            } else {
+                tampilkanStatus("Kolom tanggal opname tidak terdeteksi.", "error");
+            }
+
+        } catch (err) {
+            tampilkanStatus("Gagal membaca file: " + err.message, "error");
+        }
+    }
+
+    async function prosesStok() {
+        const fileKledo = document.getElementById('fileKledo').files[0];
+        const selectTanggal = document.getElementById('pilihTanggal');
+        document.getElementById('downloadArea').style.display = 'none';
+
+        if (!fileKledo || !dataOpnameMentah || selectTanggal.options.length === 0) {
+            alert("Pastikan kedua file Excel sudah dimasukkan!");
+            return;
+        }
+
+        tampilkanStatus("Sedang menghitung selisih...", "info");
+        tanggalTeks = selectTanggal.options[selectTanggal.selectedIndex].text;
+
+        try {
+            const dataKledoMentah = await bacaExcel(fileKledo);
+            const idxHeaderKledo = cariBarisHeader(dataKledoMentah, "Nama Produk");
+            
+            if (idxHeaderKledo === -1) {
+                tampilkanStatus("Kolom 'Nama Produk' tidak ditemukan di file Kledo!", "error");
+                return;
+            }
+
+            const headersKledo = dataKledoMentah[idxHeaderKledo].map(h => String(h).trim());
+            const idxNamaKledo = headersKledo.indexOf("Nama Produk");
+            const idxTotalKledo = headersKledo.indexOf("Total");
+
+            let mapKledo = {};
+            for (let i = idxHeaderKledo + 1; i < dataKledoMentah.length; i++) {
+                let row = dataKledoMentah[i];
+                let nama = String(row[idxNamaKledo] || "").trim();
+                if (nama && nama !== "Total") {
+                    mapKledo[nama] = parseInt(String(row[idxTotalKledo] || "0").replace(/[\s,.]/g, "")) || 0;
+                }
+            }
+
+            const idxHeaderOpname = cariBarisHeader(dataOpnameMentah, "Nama Produk");
+            const idxNamaOpname = headersOpname.indexOf("Nama Produk");
+            const idxTanggalTerpilih = parseInt(selectTanggal.value);
+
+            let hasilSelisih = [];
+            let outputFull = []; // Gunakan array baru agar data asli tidak rusak/bergeser
+
+            // Kunci posisi di Kolom F (indeks 5) dan Kolom G (indeks 6)
+            const COL_KLEDO = 5; 
+            const COL_SELISIH = 6;
+
+            for (let i = 0; i < dataOpnameMentah.length; i++) {
+                // Copy baris agar tidak memodifikasi file mentah secara berulang
+                let rowAsli = dataOpnameMentah[i] || [];
+                let rowBaru = [...rowAsli];
+                
+                // Pastikan baris selalu punya panjang sampai kolom G
+                while(rowBaru.length <= COL_SELISIH) {
+                    rowBaru.push("");
+                }
+                
+                if (i < idxHeaderOpname) {
+                    rowBaru[COL_KLEDO] = "";
+                    rowBaru[COL_SELISIH] = "";
+                    outputFull.push(rowBaru);
+                    continue;
+                }
+                
+                if (i === idxHeaderOpname) {
+                    rowBaru[COL_KLEDO] = "Stok Kledo (Update)";
+                    rowBaru[COL_SELISIH] = "Selisih";
+                    outputFull.push(rowBaru);
+                    continue;
+                }
+
+                let nama = String(rowBaru[idxNamaOpname] || "").trim();
+                if (!nama || nama.toLowerCase() === "total") {
+                    rowBaru[COL_KLEDO] = ""; 
+                    rowBaru[COL_SELISIH] = ""; 
+                    outputFull.push(rowBaru);
+                    continue;
+                }
+
+                let stokKledo = mapKledo[nama] || 0;
+                let stokReal = parseInt(String(rowBaru[idxTanggalTerpilih] || "0").replace(/[\s,.]/g, "")) || 0;
+                let selisih = stokReal - stokKledo;
+
+                // Tulis nilai tepat di kolom F dan G
+                rowBaru[COL_KLEDO] = stokKledo;
+                rowBaru[COL_SELISIH] = selisih;
+                
+                outputFull.push(rowBaru);
+
+                if (selisih !== 0) {
+                    hasilSelisih.push({ "Nama Produk": nama, "Stok Kledo": stokKledo, "Stok Real": stokReal, "Selisih": selisih });
+                }
+            }
+
+            csvHanyaSelisih = "\uFEFFNama Produk,Stok Kledo,Stok Real,Selisih\n";
+            hasilSelisih.forEach(h => {
+                let namaSafe = h["Nama Produk"].includes(",") ? `"${h["Nama Produk"]}"` : h["Nama Produk"];
+                csvHanyaSelisih += `${namaSafe},${h["Stok Kledo"]},${h["Stok Real"]},${h["Selisih"]}\n`;
+            });
+
+            // Jadikan output array baru tersebut menjadi CSV
+            csvSemuaStok = aoaKeCsv(outputFull);
+
+            tampilkanStatus(`Selesai dihitung! Ditemukan ${hasilSelisih.length} barang yang selisih.`, "success");
+            document.getElementById('downloadArea').style.display = 'block';
+
+        } catch (err) {
+            tampilkanStatus("Error pemrosesan: " + err.message, "error");
+            console.error(err);
+        }
+    }
+
+    function downloadHanyaSelisih() {
+        const blob = new Blob([csvHanyaSelisih], { type: 'text/csv;charset=utf-8;' });
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = `Hanya_Selisih_Stok_${tanggalTeks}.csv`;
+        link.click();
+    }
+
+    function downloadSemuaStok() {
+        const blob = new Blob([csvSemuaStok], { type: 'text/csv;charset=utf-8;' });
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = `Semua_Stok_NS_Plus_Selisih_${tanggalTeks}.csv`;
+        link.click();
+    }
+
+    function tampilkanStatus(pesan, tipe) {
+        const statusDiv = document.getElementById('status');
+        statusDiv.className = "status " + tipe;
+        statusDiv.innerText = pesan;
+        statusDiv.style.display = "block";
+    }
+</script>
+
+</body>
+</html>
